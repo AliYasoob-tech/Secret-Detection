@@ -1,0 +1,92 @@
+name: 'Secret Detection Scanner'
+description: >
+  Two-tier IaC/CI secret scanner. fast mode uses the pure-Python GBM re-ranker;
+  llm mode uses the trained CodeBERT/UniXcoder ensemble bundle.
+
+branding:
+  icon: 'shield'
+  color: 'red'
+
+inputs:
+  target:
+    description: 'Directory or file to scan (default: repo root)'
+    required: false
+    default: '.'
+  mode:
+    description: '"fast" (default) or "llm"'
+    required: false
+    default: 'fast'
+  bundle-url:
+    description: >
+      Full URL to model_bundle.tar.gz for llm mode.
+      Defaults to the v1 GitHub Release of this action repo.
+    required: false
+    default: ''
+  block-at:
+    description: 'Override BLOCK threshold (0.0–1.0). Leave empty to use model default.'
+    required: false
+    default: ''
+  warn-at:
+    description: 'Override WARN threshold (0.0–1.0). Leave empty to use model default.'
+    required: false
+    default: ''
+  all-files:
+    description: 'Scan every file type, not just IaC/config/code extensions.'
+    required: false
+    default: 'false'
+  sarif-output:
+    description: 'Path for the SARIF 2.1.0 report uploaded to Code Scanning.'
+    required: false
+    default: 'secret-scan-results.sarif'
+
+outputs:
+  blocked:
+    description: 'Count of BLOCK-level findings'
+    value: ${{ steps.scan.outputs.blocked }}
+  warned:
+    description: 'Count of WARN-level findings'
+    value: ${{ steps.scan.outputs.warned }}
+  status:
+    description: 'Overall status: PASS | WARN | BLOCK | ERROR'
+    value: ${{ steps.scan.outputs.status }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install fast-mode dependencies
+      if: inputs.mode == 'fast'
+      shell: bash
+      run: pip install --quiet tomli
+
+    - name: Install llm-mode dependencies
+      if: inputs.mode == 'llm'
+      shell: bash
+      run: pip install --quiet tomli torch transformers safetensors numpy scikit-learn PyYAML
+
+    - name: Run scanner
+      id: scan
+      shell: bash
+      env:
+        INPUT_TARGET:              ${{ inputs.target }}
+        INPUT_MODE:                ${{ inputs.mode }}
+        INPUT_BUNDLE_URL:          ${{ inputs.bundle-url }}
+        INPUT_BLOCK_AT:            ${{ inputs.block-at }}
+        INPUT_WARN_AT:             ${{ inputs.warn-at }}
+        INPUT_ALL_FILES:           ${{ inputs.all-files }}
+        INPUT_SARIF:               ${{ inputs.sarif-output }}
+        ACTION_PATH:               ${{ github.action_path }}
+        GITHUB_ACTION_REPOSITORY:  ${{ github.action_repository }}
+        TARGET_WORKSPACE:          ${{ github.workspace }}
+      run: bash "${{ github.action_path }}/entrypoint.sh"
+
+    - name: Upload SARIF to Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ inputs.sarif-output }}
+      continue-on-error: true  # don't fail if repo hasn't enabled Code Scanning

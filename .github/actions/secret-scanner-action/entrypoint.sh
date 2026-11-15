@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# Secret Detection Action — entrypoint
+# Runs either the fast GBM scanner or the llm encoder bundle,
+# then normalises output, emits annotations, and writes SARIF.
+set -euo pipefail
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+ACTION_DIR="${ACTION_PATH}"
+FAST_SCANNER="${ACTION_DIR}/scanner/scan.py"
+NORMALISE="${ACTION_DIR}/normalise.py"
+TO_SARIF="${ACTION_DIR}/to_sarif.py"
+
+RAW_JSON=$(mktemp /tmp/scan-raw-XXXXXX.json)
+NORM_JSON=$(mktemp /tmp/scan-norm-XXXXXX.json)
+
+echo "::group::Secret Detection Scanner (mode=${INPUT_MODE})"
+
+# ── Resolve bundle URL ────────────────────────────────────────────────────────
+# Default: GitHub Release of this action repo
+ACTION_REPO="${GITHUB_ACTION_REPOSITORY:-AliYasoob-tech/secret-scanner-action}"
+REPO_URL="https://github.com/${ACTION_REPO}/releases/download/v1/model_bundle.tar.gz"
+BUNDLE_URL="${INPUT_BUNDLE_URL:-$REPO_URL}"
+
+# ── Mode: fast ────────────────────────────────────────────────────────────────
+if [[ "${INPUT_MODE}" == "fast" ]]; then
+    echo ">> Mode: fast (GBM re-ranker, no ML deps)"
+
+    ARGS=("${INPUT_TARGET}" --json "${RAW_JSON}")
+    [[ -n "${INPUT_BLOCK_AT}" ]] && ARGS+=(--block-at "${INPUT_BLOCK_AT}")
+    [[ -n "${INPUT_WARN_AT}"  ]] && ARGS+=(--warn-at  "${INPUT_WARN_AT}")
+    [[ "${INPUT_ALL_FILES}" == "true" ]] && ARGS+=(--all-files)
+
+    set +e
+    python3 "${FAST_SCANNER}" "${ARGS[@]}"
+    SCAN_EXIT=$?
+    set -e
+
+# ── Mode: llm ─────────────────────────────────────────────────────────────────
+elif [[ "${INPUT_MODE}" == "llm" ]]; then
+    echo ">> Mode: llm (CodeBERT + UniXcoder ensemble)"
+
+    # --- Cache-aligned Model bundle directory (${HOME}/.secret-scanner-model) ---
+    BUNDLE_DIR="${HOME}/.secret-scanner-model"
+    mkdir -p "${BUNDLE_DIR}"
+
+    # Helper function to find selected.json
+    find_selected_json() {
+        if [[ -f "${BUNDLE_DIR}/selected.json" ]]; then
+            echo "${BUNDLE_DIR}/selected.json"
+        elif [[ -f "${BUNDLE_DIR}/artifacts/experiment/selected.json" ]]; then
+            echo "${BUNDLE_DIR}/artifacts/experiment/selected.json"
+        else
+            echo ""
+        fi
+    }
+
+    SELECTED_JSON=$(find_selected_json)
+
+    if [[ -z "${SELECTED_JSON}" ]]; then
+        echo ">> Downloading model bundle from: ${BUNDLE_URL}"
+        BUNDLE_TGZ=$(mktemp /tmp/model_bundle-XXXXXX.tar.gz)
+
+        # Do NOT pass Authorization header to public release redirects (avoids S3 400 Bad Request)
+        curl -fsSL --retry 3 --retry-delay 5 -L "${BUNDLE_URL}" -o "${BUNDLE_TGZ}"
+
+        echo ">> Extracting bundle into ${BUNDLE_DIR}…"
+        tar -xzf "${BUNDLE_TGZ}" -C "${BUNDLE_DIR}"
+        rm -f "${BUNDLE_TGZ}"
+
+        SELECTED_JSON=$(find_selected_json)
+        if [[ -z "${SELECTED_JSON}" ]]; then
+            echo "::error::model_bundle.tar.gz did not contain selected.json (checked root and artifacts/experiment/)"
+            exit 2
+        fi
+        echo ">> Model manifest located at: ${SELECTED_JSON}"
+    else
+        echo ">> Model bundle already present in cache: ${SELECTED_JSON}"
+    fi
+
+    # Verify model weight directories relative to selected.json parent
+    BUNDLE_ROOT="$(dirname "${SELECTED_JSON}")"
+    CB="${BUNDLE_ROOT}/runs/codebert-augmented-plain-seed37/best"
+    UX="${BUNDLE_ROOT}/runs/unixcoder-augmented-plain-seed37/best"
+    for d in "${CB}" "${UX}"; do
+        if [[ ! -d "${d}" ]]; then
+            echo "::error::Expected model directory not found: ${d}"
+            exit 2
+        fi
+    done
+    echo ">> Both ensemble models verified (${CB}, ${UX})"
+
+    # Ensure secrets_pipeline can be imported from target workspace
+    export PYTHONPATH="${TARGET_WORKSPACE:-$PWD}:${PYTHONPATH:-}"
+
+    TARGET_ABS="$(realpath "${INPUT_TARGET}")"
+    RAW_JSON_ABS="$(realpath "${RAW_JSON}")"
+    SELECTED_JSON_ABS="$(realpath "${SELECTED_JSON}")"
+
+    ARGS=("${TARGET_ABS}" --bundle "${SELECTED_JSON_ABS}" --out "${RAW_JSON_ABS}")
+    [[ "${INPUT_ALL_FILES}" == "true" ]] && ARGS+=(--all-files)
+
+    set +e
+    (cd "${TARGET_WORKSPACE:-$PWD}" && python3 -m secrets_pipeline scan "${ARGS[@]}")
+    SCAN_EXIT=$?
+    set -e
+
+else
+    echo "::error::Unknown mode '${INPUT_MODE}'. Use 'fast' or 'llm'."
+    exit 2
+fi
+
+echo "::endgroup::"
+
+# ── Normalise both output shapes ──────────────────────────────────────────────
+echo ">> Normalising scanner output (mode=${INPUT_MODE})…"
+python3 "${NORMALISE}" \
+    --raw  "${RAW_JSON}" \
+    --out  "${NORM_JSON}" \
+    --mode "${INPUT_MODE}"
+
+# ── GitHub Annotations (inline PR comments) ───────────────────────────────────
+# Fix Bug 1: Export NORM_JSON BEFORE python script executes
+export NORM_JSON
+python3 - <<'PYEOF'
+import json, os, sys
+
+norm_json = os.environ.get("NORM_JSON")
+if not norm_json or not os.path.exists(norm_json):
+    sys.exit(0)
+
+findings = json.load(open(norm_json))
+printed = 0
+for f in findings:
+    if f.get("verdict") not in ("BLOCK", "WARN"):
+        continue
+    level = "error" if f["verdict"] == "BLOCK" else "warning"
+    reason = f.get("reason", "ml-scorer")
+    msg = (f'[{f["verdict"]}] score={f["score"]:.4f}  '
+           f'via {reason}  —  {f.get("match", "[REDACTED]")}')
+    print(f'::{level} file={f["file"]},line={f["line"]}::{msg}')
+    printed += 1
+
+if printed == 0:
+    print("No BLOCK or WARN findings.")
+PYEOF
+
+# ── SARIF ─────────────────────────────────────────────────────────────────────
+python3 "${TO_SARIF}" "${NORM_JSON}" "${INPUT_SARIF}"
+echo ">> SARIF written to ${INPUT_SARIF}"
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+BLOCKED=$(python3 -c "
+import json, sys
+d = json.load(open('${NORM_JSON}'))
+print(sum(1 for f in d if f.get('verdict')=='BLOCK'))
+")
+WARNED=$(python3 -c "
+import json, sys
+d = json.load(open('${NORM_JSON}'))
+print(sum(1 for f in d if f.get('verdict')=='WARN'))
+")
+STATUS="PASS"
+[[ "${SCAN_EXIT}" -eq 1 ]] && STATUS="BLOCK"
+[[ "${SCAN_EXIT}" -eq 2 ]] && STATUS="ERROR"
+[[ "${SCAN_EXIT}" -eq 0 && "${WARNED}" -gt 0 ]] && STATUS="WARN"
+
+{
+  echo "blocked=${BLOCKED}"
+  echo "warned=${WARNED}"
+  echo "status=${STATUS}"
+} >> "${GITHUB_OUTPUT}"
+
+echo ">> Summary: BLOCK=${BLOCKED}  WARN=${WARNED}  STATUS=${STATUS}"
+
+# Clean up
+rm -f "${RAW_JSON}" "${NORM_JSON}"
+
+exit "${SCAN_EXIT}"
