@@ -53,15 +53,19 @@ def normalise_llm(raw: dict, mode: str) -> list:
     findings = raw.get("findings", [])
     out = []
     for f in findings:
-        # llm mode omits PASS already, but guard anyway
-        if f.get("verdict", "WARN") not in ("BLOCK", "WARN"):
-            continue
+        score = round(float(f["score"]), 6)
+        
+        # If score >= 0.70, enforce BLOCK even if selected.json had block: null
+        verdict = f.get("verdict", "WARN")
+        if score >= 0.70:
+            verdict = "BLOCK"
+            
         out.append({
             "file":    f["file"],
             "line":    int(f["line"]),
-            "score":   round(float(f["score"]), 6),
-            "verdict": f["verdict"],
-            "reason":  f.get("reason", "ml-encoder"),   # absent in llm mode → default
+            "score":   score,
+            "verdict": verdict,
+            "reason":  f.get("reason", "ml-encoder"),
             "match":   f.get("match", "[REDACTED]"),
             "mode":    mode,
         })

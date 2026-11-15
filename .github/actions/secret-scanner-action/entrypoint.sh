@@ -187,6 +187,28 @@ python3 "${NORMALISE}" \
     --out  "${NORM_JSON}" \
     --mode "${INPUT_MODE}"
 
+
+
+# ── Normalise both output shapes ──────────────────────────────────────────────
+echo ">> Normalising scanner output (mode=${INPUT_MODE})…"
+python3 "${NORMALISE}" \
+    --raw  "${RAW_JSON}" \
+    --out  "${NORM_JSON}" \
+    --mode "${INPUT_MODE}"
+
+# ── Enforce exit code 1 if any finding has verdict == BLOCK ───────────────────
+BLOCKED_COUNT=$(python3 -c "
+import json
+d = json.load(open('${NORM_JSON}'))
+print(sum(1 for f in d if f.get('verdict')=='BLOCK'))
+")
+
+if [[ "${BLOCKED_COUNT}" -gt 0 ]]; then
+    SCAN_EXIT=1
+fi
+
+
+
 # ── GitHub Annotations (inline PR comments) ───────────────────────────────────
 # Fix Bug 1: Export NORM_JSON BEFORE python script executes
 export NORM_JSON
