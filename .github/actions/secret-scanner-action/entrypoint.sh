@@ -25,15 +25,48 @@ BUNDLE_URL="${INPUT_BUNDLE_URL:-$REPO_URL}"
 if [[ "${INPUT_MODE}" == "fast" ]]; then
     echo ">> Mode: fast (GBM re-ranker, no ML deps)"
 
-    ARGS=("${INPUT_TARGET}" --json "${RAW_JSON}")
-    [[ -n "${INPUT_BLOCK_AT}" ]] && ARGS+=(--block-at "${INPUT_BLOCK_AT}")
-    [[ -n "${INPUT_WARN_AT}"  ]] && ARGS+=(--warn-at  "${INPUT_WARN_AT}")
-    [[ "${INPUT_ALL_FILES}" == "true" ]] && ARGS+=(--all-files)
+    TARGET_PATHS=(${INPUT_TARGET})
 
-    set +e
-    python3 "${FAST_SCANNER}" "${ARGS[@]}"
-    SCAN_EXIT=$?
-    set -e
+    if [[ ${#TARGET_PATHS[@]} -gt 1 ]]; then
+        echo ">> Scanning ${#TARGET_PATHS[@]} individual changed files…"
+        MERGED_JSON=$(mktemp /tmp/merged-XXXXXX.json)
+        echo "[]" > "${MERGED_JSON}"
+        for f in "${TARGET_PATHS[@]}"; do
+            if [[ -f "$f" ]]; then
+                FILE_RAW=$(mktemp /tmp/file-raw-XXXXXX.json)
+                ARGS=("$f" --json "${FILE_RAW}")
+                [[ -n "${INPUT_BLOCK_AT}" ]] && ARGS+=(--block-at "${INPUT_BLOCK_AT}")
+                [[ -n "${INPUT_WARN_AT}"  ]] && ARGS+=(--warn-at  "${INPUT_WARN_AT}")
+                [[ "${INPUT_ALL_FILES}" == "true" ]] && ARGS+=(--all-files)
+                python3 "${FAST_SCANNER}" "${ARGS[@]}" || true
+                python3 -c "
+import json
+try:
+    m = json.load(open('${MERGED_JSON}'))
+    r = json.load(open('${FILE_RAW}'))
+    if isinstance(r, list):
+        m.extend(r)
+    json.dump(m, open('${MERGED_JSON}', 'w'))
+except Exception:
+    pass
+"
+                rm -f "${FILE_RAW}"
+            fi
+        done
+        mv "${MERGED_JSON}" "${RAW_JSON}"
+        BLOCKED_COUNT=$(python3 -c "import json; print(sum(1 for x in json.load(open('${RAW_JSON}')) if x.get('verdict')=='BLOCK'))")
+        SCAN_EXIT=$(( BLOCKED_COUNT > 0 ? 1 : 0 ))
+    else
+        ARGS=("${INPUT_TARGET}" --json "${RAW_JSON}")
+        [[ -n "${INPUT_BLOCK_AT}" ]] && ARGS+=(--block-at "${INPUT_BLOCK_AT}")
+        [[ -n "${INPUT_WARN_AT}"  ]] && ARGS+=(--warn-at  "${INPUT_WARN_AT}")
+        [[ "${INPUT_ALL_FILES}" == "true" ]] && ARGS+=(--all-files)
+
+        set +e
+        python3 "${FAST_SCANNER}" "${ARGS[@]}"
+        SCAN_EXIT=$?
+        set -e
+    fi
 
 # ── Mode: llm ─────────────────────────────────────────────────────────────────
 elif [[ "${INPUT_MODE}" == "llm" ]]; then
@@ -92,17 +125,52 @@ elif [[ "${INPUT_MODE}" == "llm" ]]; then
     # Ensure secrets_pipeline can be imported from target workspace
     export PYTHONPATH="${TARGET_WORKSPACE:-$PWD}:${PYTHONPATH:-}"
 
-    TARGET_ABS="$(realpath "${INPUT_TARGET}")"
-    RAW_JSON_ABS="$(realpath "${RAW_JSON}")"
-    SELECTED_JSON_ABS="$(realpath "${SELECTED_JSON}")"
+    TARGET_PATHS=(${INPUT_TARGET})
 
-    ARGS=("${TARGET_ABS}" --bundle "${SELECTED_JSON_ABS}" --out "${RAW_JSON_ABS}")
-    [[ "${INPUT_ALL_FILES}" == "true" ]] && ARGS+=(--all-files)
+    if [[ ${#TARGET_PATHS[@]} -gt 1 ]]; then
+        echo ">> Running deep LLM scan across ${#TARGET_PATHS[@]} individual changed files…"
+        MERGED_JSON=$(mktemp /tmp/merged-llm-XXXXXX.json)
+        echo '{"status":"PASS","findings":[]}' > "${MERGED_JSON}"
+        for f in "${TARGET_PATHS[@]}"; do
+            if [[ -f "$f" ]]; then
+                FILE_RAW=$(mktemp /tmp/file-llm-raw-XXXXXX.json)
+                F_ABS="$(realpath "$f")"
+                SEL_ABS="$(realpath "${SELECTED_JSON}")"
+                (cd "${TARGET_WORKSPACE:-$PWD}" && python3 -m secrets_pipeline scan "${F_ABS}" --bundle "${SEL_ABS}" --out "${FILE_RAW}") || true
+                python3 -c "
+import json
+try:
+    m = json.load(open('${MERGED_JSON}'))
+    r = json.load(open('${FILE_RAW}'))
+    if isinstance(r, dict) and 'findings' in r:
+        m['findings'].extend(r['findings'])
+        if r.get('status') == 'BLOCK':
+            m['status'] = 'BLOCK'
+        elif r.get('status') == 'WARN' and m.get('status') != 'BLOCK':
+            m['status'] = 'WARN'
+    json.dump(m, open('${MERGED_JSON}', 'w'))
+except Exception:
+    pass
+"
+                rm -f "${FILE_RAW}"
+            fi
+        done
+        mv "${MERGED_JSON}" "${RAW_JSON}"
+        BLOCKED_COUNT=$(python3 -c "import json; print(sum(1 for x in json.load(open('${RAW_JSON}')).get('findings',[]) if x.get('verdict')=='BLOCK'))")
+        SCAN_EXIT=$(( BLOCKED_COUNT > 0 ? 1 : 0 ))
+    else
+        TARGET_ABS="$(realpath "${INPUT_TARGET}")"
+        RAW_JSON_ABS="$(realpath "${RAW_JSON}")"
+        SELECTED_JSON_ABS="$(realpath "${SELECTED_JSON}")"
 
-    set +e
-    (cd "${TARGET_WORKSPACE:-$PWD}" && python3 -m secrets_pipeline scan "${ARGS[@]}")
-    SCAN_EXIT=$?
-    set -e
+        ARGS=("${TARGET_ABS}" --bundle "${SELECTED_JSON_ABS}" --out "${RAW_JSON_ABS}")
+        [[ "${INPUT_ALL_FILES}" == "true" ]] && ARGS+=(--all-files)
+
+        set +e
+        (cd "${TARGET_WORKSPACE:-$PWD}" && python3 -m secrets_pipeline scan "${ARGS[@]}")
+        SCAN_EXIT=$?
+        set -e
+    fi
 
 else
     echo "::error::Unknown mode '${INPUT_MODE}'. Use 'fast' or 'llm'."
