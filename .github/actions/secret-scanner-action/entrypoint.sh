@@ -89,20 +89,21 @@ elif [[ "${INPUT_MODE}" == "llm" ]]; then
 
     SELECTED_JSON=$(find_selected_json)
 
-    if [[ -z "${SELECTED_JSON}" ]]; then
-        echo ">> Downloading model bundle from: ${BUNDLE_URL}"
-        BUNDLE_TGZ=$(mktemp /tmp/model_bundle-XXXXXX.tar.gz)
+        if [[ -z "${SELECTED_JSON}" ]]; then
+        echo ">> Downloading private model bundle into ${BUNDLE_DIR}…"
 
-        # Do NOT pass Authorization header to public release redirects (avoids S3 400 Bad Request)
-        curl -fsSL --retry 3 --retry-delay 5 -L "${BUNDLE_URL}" -o "${BUNDLE_TGZ}"
+        # Uses GitHub CLI to download from the current private repository's v1 release
+        gh release download v1 \
+            --pattern "model_bundle.tar.gz" \
+            --dir "${BUNDLE_DIR}" \
+            --repo "${GITHUB_REPOSITORY}"
 
-        echo ">> Extracting bundle into ${BUNDLE_DIR}…"
-        tar -xzf "${BUNDLE_TGZ}" -C "${BUNDLE_DIR}"
-        rm -f "${BUNDLE_TGZ}"
+        tar -xzf "${BUNDLE_DIR}/model_bundle.tar.gz" -C "${BUNDLE_DIR}"
+        rm -f "${BUNDLE_DIR}/model_bundle.tar.gz"
 
         SELECTED_JSON=$(find_selected_json)
         if [[ -z "${SELECTED_JSON}" ]]; then
-            echo "::error::model_bundle.tar.gz did not contain selected.json (checked root and artifacts/experiment/)"
+            echo "::error::model_bundle.tar.gz did not contain selected.json"
             exit 2
         fi
         echo ">> Model manifest located at: ${SELECTED_JSON}"
