@@ -35,3 +35,8 @@ resource "aws_s3_bucket" "static_assets" {
   bucket        = "company-production-assets-2026"
   force_destroy = false
 }
+# Test: Leaked secret injection to verify blocker
+locals {
+  aws_admin_key = "AKIAIOSFODNN7EXAMPLEKEY"
+  db_hardcoded_pass = "P@ssw0rd2026!AdminAccess"
+}
