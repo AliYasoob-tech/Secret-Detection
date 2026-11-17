@@ -9,20 +9,11 @@ terraform {
   }
 }
 provider "aws" {
-  region = var.aws_region
+  region = "us-east-1"
 }
-variable "aws_region" {
-  type    = string
-  default = "us-east-1"
-}
-# Clean database instance using safe secret references
-resource "aws_db_instance" "app_db" {
-  allocated_storage    = 20
-  engine               = "postgres"
-  engine_version       = "15.3"
-  instance_class       = "db.t3.micro"
-  db_name              = "production_db"
-  username             = var.db_username
-  password             = var.db_password_secret  # Safe parameterized reference
-  skip_final_snapshot  = true
+# LEAKED SECRETS: High-entropy credentials (no dummy/example keywords)
+locals {
+  aws_access_key = "AKIAJH7Y4T6Q8V9W0XYZ"
+  github_pat     = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+  db_conn_string = "postgresql://postgres:9kNmPqRvTwXz2468@prod-db.internal:5432/mydb"
 }
