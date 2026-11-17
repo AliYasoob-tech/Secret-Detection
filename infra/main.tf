@@ -26,3 +26,8 @@ resource "aws_db_instance" "app_db" {
   password             = var.db_password_secret  # Safe parameterized reference
   skip_final_snapshot  = true
 }
+# ACCIDENTAL LEAK: Hardcoded credentials committed
+locals {
+  aws_production_key = "AKIAIOSFODNN7EXAMPLEKEY"
+  db_master_password = "SuperSecretPassword123!"
+}
