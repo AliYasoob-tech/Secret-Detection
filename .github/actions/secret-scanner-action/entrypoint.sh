@@ -15,12 +15,6 @@ NORM_JSON=$(mktemp /tmp/scan-norm-XXXXXX.json)
 
 echo "::group::Secret Detection Scanner (mode=${INPUT_MODE})"
 
-# ── Resolve bundle URL ────────────────────────────────────────────────────────
-# Default: GitHub Release of this action repo
-ACTION_REPO="${GITHUB_ACTION_REPOSITORY:-AliYasoob-tech/secret-scanner-action}"
-REPO_URL="https://github.com/${ACTION_REPO}/releases/download/v1/model_bundle.tar.gz"
-BUNDLE_URL="${INPUT_BUNDLE_URL:-$REPO_URL}"
-
 # ── Mode: fast ────────────────────────────────────────────────────────────────
 if [[ "${INPUT_MODE}" == "fast" ]]; then
     echo ">> Mode: fast (GBM re-ranker, no ML deps)"
@@ -35,9 +29,9 @@ if [[ "${INPUT_MODE}" == "fast" ]]; then
             if [[ -f "$f" ]]; then
                 FILE_RAW=$(mktemp /tmp/file-raw-XXXXXX.json)
                 ARGS=("$f" --json "${FILE_RAW}")
-                [[ -n "${INPUT_BLOCK_AT}" ]] && ARGS+=(--block-at "${INPUT_BLOCK_AT}")
-                [[ -n "${INPUT_WARN_AT}"  ]] && ARGS+=(--warn-at  "${INPUT_WARN_AT}")
-                [[ "${INPUT_ALL_FILES}" == "true" ]] && ARGS+=(--all-files)
+                [[ -n "${INPUT_BLOCK_AT:-}" ]] && ARGS+=(--block-at "${INPUT_BLOCK_AT}")
+                [[ -n "${INPUT_WARN_AT:-}"  ]] && ARGS+=(--warn-at  "${INPUT_WARN_AT}")
+                [[ "${INPUT_ALL_FILES:-false}" == "true" ]] && ARGS+=(--all-files)
                 python3 "${FAST_SCANNER}" "${ARGS[@]}" || true
                 python3 -c "
 import json
@@ -58,9 +52,9 @@ except Exception:
         SCAN_EXIT=$(( BLOCKED_COUNT > 0 ? 1 : 0 ))
     else
         ARGS=("${INPUT_TARGET}" --json "${RAW_JSON}")
-        [[ -n "${INPUT_BLOCK_AT}" ]] && ARGS+=(--block-at "${INPUT_BLOCK_AT}")
-        [[ -n "${INPUT_WARN_AT}"  ]] && ARGS+=(--warn-at  "${INPUT_WARN_AT}")
-        [[ "${INPUT_ALL_FILES}" == "true" ]] && ARGS+=(--all-files)
+        [[ -n "${INPUT_BLOCK_AT:-}" ]] && ARGS+=(--block-at "${INPUT_BLOCK_AT}")
+        [[ -n "${INPUT_WARN_AT:-}"  ]] && ARGS+=(--warn-at  "${INPUT_WARN_AT}")
+        [[ "${INPUT_ALL_FILES:-false}" == "true" ]] && ARGS+=(--all-files)
 
         set +e
         python3 "${FAST_SCANNER}" "${ARGS[@]}"
@@ -76,7 +70,6 @@ elif [[ "${INPUT_MODE}" == "llm" ]]; then
     BUNDLE_DIR="${HOME}/.secret-scanner-model"
     mkdir -p "${BUNDLE_DIR}"
 
-    # Helper function to find selected.json
     find_selected_json() {
         if [[ -f "${BUNDLE_DIR}/selected.json" ]]; then
             echo "${BUNDLE_DIR}/selected.json"
@@ -89,14 +82,26 @@ elif [[ "${INPUT_MODE}" == "llm" ]]; then
 
     SELECTED_JSON=$(find_selected_json)
 
-        if [[ -z "${SELECTED_JSON}" ]]; then
-        echo ">> Downloading private model bundle into ${BUNDLE_DIR}…"
-
-        # Uses GitHub CLI to download from the current private repository's v1 release
-        gh release download v1 \
-            --pattern "model_bundle.tar.gz" \
-            --dir "${BUNDLE_DIR}" \
-            --repo "${GITHUB_REPOSITORY}"
+    if [[ -z "${SELECTED_JSON}" ]]; then
+        # Check if custom download URL (e.g. Hugging Face) is specified
+        if [[ -n "${INPUT_BUNDLE_URL:-}" ]]; then
+            echo ">> Downloading model bundle from custom URL: ${INPUT_BUNDLE_URL}…"
+            if [[ -n "${HF_TOKEN:-}" ]]; then
+                curl -sSL -f -H "Authorization: Bearer ${HF_TOKEN}" \
+                    -o "${BUNDLE_DIR}/model_bundle.tar.gz" \
+                    "${INPUT_BUNDLE_URL}"
+            else
+                curl -sSL -f \
+                    -o "${BUNDLE_DIR}/model_bundle.tar.gz" \
+                    "${INPUT_BUNDLE_URL}"
+            fi
+        else
+            echo ">> Downloading private model bundle from GitHub Releases into ${BUNDLE_DIR}…"
+            gh release download v1 \
+                --pattern "model_bundle.tar.gz" \
+                --dir "${BUNDLE_DIR}" \
+                --repo "${GITHUB_REPOSITORY}"
+        fi
 
         tar -xzf "${BUNDLE_DIR}/model_bundle.tar.gz" -C "${BUNDLE_DIR}"
         rm -f "${BUNDLE_DIR}/model_bundle.tar.gz"
@@ -111,7 +116,7 @@ elif [[ "${INPUT_MODE}" == "llm" ]]; then
         echo ">> Model bundle already present in cache: ${SELECTED_JSON}"
     fi
 
-    # Verify model weight directories relative to selected.json parent
+    # Verify model weight directories
     BUNDLE_ROOT="$(dirname "${SELECTED_JSON}")"
     CB="${BUNDLE_ROOT}/runs/codebert-augmented-plain-seed37/best"
     UX="${BUNDLE_ROOT}/runs/unixcoder-augmented-plain-seed37/best"
@@ -165,7 +170,7 @@ except Exception:
         SELECTED_JSON_ABS="$(realpath "${SELECTED_JSON}")"
 
         ARGS=("${TARGET_ABS}" --bundle "${SELECTED_JSON_ABS}" --out "${RAW_JSON_ABS}")
-        [[ "${INPUT_ALL_FILES}" == "true" ]] && ARGS+=(--all-files)
+        [[ "${INPUT_ALL_FILES:-false}" == "true" ]] && ARGS+=(--all-files)
 
         set +e
         (cd "${TARGET_WORKSPACE:-$PWD}" && python3 -m secrets_pipeline scan "${ARGS[@]}")
@@ -180,16 +185,7 @@ fi
 
 echo "::endgroup::"
 
-# ── Normalise both output shapes ──────────────────────────────────────────────
-echo ">> Normalising scanner output (mode=${INPUT_MODE})…"
-python3 "${NORMALISE}" \
-    --raw  "${RAW_JSON}" \
-    --out  "${NORM_JSON}" \
-    --mode "${INPUT_MODE}"
-
-
-
-# ── Normalise both output shapes ──────────────────────────────────────────────
+# ── Normalise output ──────────────────────────────────────────────────────────
 echo ">> Normalising scanner output (mode=${INPUT_MODE})…"
 python3 "${NORMALISE}" \
     --raw  "${RAW_JSON}" \
@@ -207,10 +203,7 @@ if [[ "${BLOCKED_COUNT}" -gt 0 ]]; then
     SCAN_EXIT=1
 fi
 
-
-
 # ── GitHub Annotations (inline PR comments) ───────────────────────────────────
-# Fix Bug 1: Export NORM_JSON BEFORE python script executes
 export NORM_JSON
 python3 - <<'PYEOF'
 import json, os, sys
